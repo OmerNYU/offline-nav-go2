@@ -1,0 +1,40 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "BeliefState",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["target_status", "goal_text", "active_constraints", "candidate_nodes", "next_action"],
+  "properties": {
+    "target_status": {
+      "type": "string",
+      "enum": ["searching", "visible", "likely_in_memory", "unreachable", "done"]
+    },
+    "current_node_id": { "type": ["integer", "null"], "minimum": 0 },
+    "goal_text": { "type": "string", "minLength": 1, "maxLength": 80 },
+    "active_constraints": { "type": "array", "items": { "type": "string" } },
+    "candidate_nodes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["node_id", "score"],
+        "properties": {
+          "node_id": { "type": "integer", "minimum": 0 },
+          "score": { "type": "number", "minimum": 0.0, "maximum": 1.0 }
+        }
+      }
+    },
+    "last_vlm_hypothesis": {
+      "anyOf": [
+        { "$ref": "./vlm_hypothesis.schema.json" },
+        { "type": "null" }
+      ]
+    },
+    "rejection_reason": { "type": ["string", "null"], "maxLength": 120 },
+    "next_action": {
+      "type": "string",
+      "enum": ["approach", "explore", "rotate", "goto_node", "ask_clarification", "stop"]
+    }
+  }
+}
+
