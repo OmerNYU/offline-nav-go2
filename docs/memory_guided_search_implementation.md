@@ -127,13 +127,14 @@ The `retrieve_candidates()` function implements a sophisticated scoring system:
    - Map cosine [-1, 1] → [0, 1] via `(cos + 1.0) / 2.0`
    - Compute keyword overlap: `len(goal_tokens ∩ node_tokens) / len(goal_tokens)`
    - Blend: `0.8 * embedding_score + 0.2 * keyword_score`
+   - Apply garbage candidate guard: If `keyword_score == 0` and `abs(embedding_score - 0.5) < 0.05`, multiply score by 0.5
    - Clamp to [0, 1] for numeric safety
 5. **Sorting**: Sort by score (descending) with tie-break on `node_id` (ascending)
 6. **Top-K**: Return top `k` candidates (default 5)
 
 ### Belief State Bridge Logic
 
-The `apply_memory_retrieval()` function implements state transition rules:
+The `apply_memory_retrieval()` function implements state transition rules and mutates the belief dictionary in-place (returns `None`):
 
 ```python
 if target_status == "visible":
@@ -164,6 +165,7 @@ else:
     candidates = []
 
 # Always update belief (even if empty) for schema safety
+# Function mutates belief in-place, returns None
 apply_memory_retrieval(belief, candidates, MEMORY_SCORE_THRESH)
 
 # Log retrieval metadata
@@ -452,6 +454,43 @@ I verified that all acceptance criteria from the specification have been met:
 ✅ Logging only stores {node_id, score}, not full node payloads  
 ✅ Scores are correct Python float type in [0.0, 1.0] range  
 ✅ seed_demo_store() usage marked with TODO for production replacement
+
+## Post-Implementation Improvements
+
+### Improvement 1: Unambiguous Memory Bridge Behavior
+
+I refactored `apply_memory_retrieval()` to make its mutation behavior explicit and unambiguous:
+
+**Before**: Function returned `Dict[str, Any]` but was called without capturing the return value, creating ambiguity about whether it mutates in-place or is a pure function.
+
+**After**: 
+- Changed return type to `None`
+- Function signature now clearly indicates it's a mutator: `apply_memory_retrieval(...) -> None`
+- Updated docstring to explicitly state "mutates in-place"
+- Removed return statement
+- Call site remains unchanged: `apply_memory_retrieval(belief, candidates, threshold)`
+
+This change eliminates potential bugs from silently ignoring return values and makes the code's intent crystal clear.
+
+### Improvement 2: Garbage Candidate Guard
+
+I added a lightweight filter to prevent stub embeddings from promoting random nodes with low signal:
+
+**Implementation**:
+- After computing `keyword_score` and `embedding_score`, check if:
+  - `keyword_score == 0.0` (no keyword overlap)
+  - `abs(embedding_score - 0.5) < 0.05` (embedding is near-random, which is 0.5 after mapping)
+- If both conditions are true, multiply `final_score` by 0.5 to penalize low-signal candidates
+
+**Rationale**:
+- Stub embeddings can produce random-looking similarity scores near 0.5
+- Without keyword overlap, these are likely spurious matches
+- Multiplying by 0.5 reduces their ranking while keeping all nodes in results (maintains schema shape)
+- Deterministic and lightweight (no changes to output structure)
+
+**Example**: A node with no keyword overlap and embedding_score = 0.52 would normally get final_score ≈ 0.42 (0.8 * 0.52 + 0.2 * 0), but with the guard it becomes ≈ 0.21, preventing it from ranking above nodes with actual semantic matches.
+
+Both improvements maintain backward compatibility, pass all existing tests, and improve the robustness of the memory retrieval system.
 
 ## Future Considerations
 

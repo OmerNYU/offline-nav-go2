@@ -7,8 +7,8 @@ def apply_memory_retrieval(
     belief: Dict[str, Any],
     candidates: list[dict],
     threshold: float = 0.3
-) -> Dict[str, Any]:
-    """Apply memory retrieval results to belief state.
+) -> None:
+    """Apply memory retrieval results to belief state (mutates in-place).
     
     Updates belief["candidate_nodes"] and potentially belief["target_status"]
     based on retrieval results, respecting monotonicity constraints to prevent
@@ -24,9 +24,6 @@ def apply_memory_retrieval(
         belief: Current belief state dictionary (modified in-place).
         candidates: List of retrieved candidates with node_id and score.
         threshold: Score threshold for promotion to "likely_in_memory".
-        
-    Returns:
-        The modified belief dictionary (same object as input).
     """
     # Always update candidate_nodes (even if empty) for schema safety
     belief["candidate_nodes"] = candidates
@@ -51,6 +48,4 @@ def apply_memory_retrieval(
             belief["target_status"] = "likely_in_memory"
         # Otherwise remain searching
     # else: keep current status for any other states
-    
-    return belief
 

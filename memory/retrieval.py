@@ -40,6 +40,10 @@ def retrieve_candidates(
     """Retrieve top-k memory nodes matching goal_text.
     
     Uses hybrid scoring: 0.8 * embedding_similarity + 0.2 * keyword_overlap.
+    Applies garbage candidate guard: if keyword_score == 0 and embedding_score
+    is near-random (within 0.05 of 0.5), multiplies final_score by 0.5 to
+    reduce low-signal matches from stub embeddings.
+    
     Deterministic ordering with explicit tie-breaking by node_id.
     
     Args:
@@ -91,6 +95,11 @@ def retrieve_candidates(
         
         # Blend scores: 0.8 embedding + 0.2 keywords
         final_score = 0.8 * embedding_score + 0.2 * keyword_score
+        
+        # Garbage candidate guard: penalize low-signal matches
+        # If no keyword overlap and embedding is near-random (0.5), reduce score
+        if keyword_score == 0.0 and abs(embedding_score - 0.5) < 0.05:
+            final_score = final_score * 0.5
         
         # Clamp to [0, 1] for numeric safety
         final_score = max(0.0, min(1.0, final_score))
