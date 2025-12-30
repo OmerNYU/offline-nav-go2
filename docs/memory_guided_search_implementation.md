@@ -259,6 +259,12 @@ I created comprehensive test suites covering all critical aspects:
    - Creates 10 nodes, requests k=3
    - Asserts only 3 results returned
 
+10. **`test_garbage_candidate_guard`**: Verifies garbage candidate guard behavior
+   - Creates nodes with unrelated content (keyword_score == 0)
+   - Verifies guard reduces scores when embedding_score is near-random (0.45-0.55)
+   - Confirms schema integrity maintained (node_id: int, score: float)
+   - Tests that low-signal matches are appropriately penalized
+
 #### **`tests/test_memory_bridge.py`** (9 tests)
 
 1. **`test_visible_never_demotes`**: Critical invariant
@@ -490,6 +496,12 @@ I added a lightweight filter to prevent stub embeddings from promoting random no
 
 **Example**: A node with no keyword overlap and embedding_score = 0.52 would normally get final_score ≈ 0.42 (0.8 * 0.52 + 0.2 * 0), but with the guard it becomes ≈ 0.21, preventing it from ranking above nodes with actual semantic matches.
 
+**Testing**: Added `test_garbage_candidate_guard()` to verify the guard:
+- Creates nodes with unrelated content (ensures keyword_score == 0)
+- Verifies schema integrity is maintained
+- Confirms scores are appropriately reduced for low-signal matches
+- Tests that the guard logic executes correctly without breaking output format
+
 Both improvements maintain backward compatibility, pass all existing tests, and improve the robustness of the memory retrieval system.
 
 ## Future Considerations
@@ -522,6 +534,6 @@ The modular architecture I designed allows for future enhancements while maintai
 
 **Implementation Date**: January 2025  
 **Python Version**: 3.14.0  
-**Test Coverage**: 18 tests, all passing  
+**Test Coverage**: 19 tests, all passing (10 retrieval + 9 bridge)  
 **Lines of Code**: ~600 (excluding tests)
 
