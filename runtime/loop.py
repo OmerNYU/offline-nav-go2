@@ -9,8 +9,13 @@ from typing import Any, Dict, Optional, Tuple
 
 from jsonschema import Draft7Validator, RefResolver
 
+from memory.embedding import DeterministicEmbedder
+from memory.retrieval import retrieve_candidates
+from memory.store import seed_demo_store
+from memory.utils import tokenize
 from planner.verifier_stub import VerifierStub
 from runtime.logger import DecisionLogger
+from runtime.memory_bridge import apply_memory_retrieval
 
 
 def load_schemas() -> Tuple[Dict[str, Any], Dict[str, Any], Draft7Validator, Draft7Validator]:
@@ -194,7 +199,8 @@ def initialize_belief_state(belief_validator: Draft7Validator) -> Dict[str, Any]
         "candidate_nodes": [],
         "next_action": "explore",  # Valid enum value
         "current_node_id": None,
-        "last_vlm_hypothesis": None
+        "last_vlm_hypothesis": None,
+        "rejection_reason": None  # Explicit initialization for clarity
     }
     
     # Validate that initial state is schema-compliant
@@ -349,6 +355,10 @@ def run_self_check() -> None:
     print("All self-checks passed!")
 
 
+# Memory retrieval threshold (on [0,1] scale after cosine mapping)
+MEMORY_SCORE_THRESH = 0.3
+
+
 def main() -> None:
     """Main runtime loop."""
     parser = argparse.ArgumentParser(description="Offline semantic navigation runtime loop")
@@ -370,10 +380,29 @@ def main() -> None:
     logger = DecisionLogger()
     belief = initialize_belief_state(belief_validator)
     
+    # Initialize memory components
+    # TODO: Replace seed_demo_store() with persisted SLAM-derived nodes in production
+    memory_store = seed_demo_store()
+    embedder = DeterministicEmbedder(dim=64)
+    
     # Main loop
     for step_id in range(args.steps):
         # Deep copy belief_before
         belief_before = json.loads(json.dumps(belief))
+        
+        # === Memory retrieval step ===
+        # Tokenize goal_text to determine if retrieval should run
+        tokens = tokenize(belief["goal_text"])
+        retrieval_ran = len(tokens) > 0
+        
+        # Only call retrieve_candidates if we have valid tokens
+        if retrieval_ran:
+            candidates = retrieve_candidates(belief["goal_text"], memory_store, embedder, k=5)
+        else:
+            candidates = []
+        
+        # Always update belief with candidates (even if empty) for schema safety
+        apply_memory_retrieval(belief, candidates, MEMORY_SCORE_THRESH)
         
         # Generate mock VLM output
         vlm_raw = generate_mock_vlm_output(rng)
@@ -382,7 +411,11 @@ def main() -> None:
         meta: Dict[str, Any] = {
             "vlm_latency_ms": 0.0,
             "verify_latency_ms": 0.0,
-            "validation_error": None
+            "validation_error": None,
+            "retrieval_ran": retrieval_ran,
+            "retrieval_topk": candidates,
+            "retrieval_best_score": candidates[0]["score"] if candidates else None,
+            "retrieval_threshold_pass": candidates[0]["score"] >= MEMORY_SCORE_THRESH if candidates else False
         }
         verifier_result: Dict[str, Any] = {
             "ok": False,

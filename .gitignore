@@ -23,3 +23,5 @@ logs/
 .DS_Store
 Thumbs.db
 
+# Cursor editor metadata
+.cursor/
