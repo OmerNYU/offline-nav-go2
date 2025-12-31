@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import os
 import random
 import time
 from pathlib import Path
@@ -16,10 +17,15 @@ from memory.utils import tokenize
 from planner.verifier_stub import VerifierStub
 from runtime.logger import DecisionLogger
 from runtime.memory_bridge import apply_memory_retrieval
+from runtime.schema_loader import load_hypothesis_validator, validate_or_error
+from vlm.fallback import generate_fallback_hypothesis
+from vlm.ollama_client import OllamaVLMClient
 
 
 def load_schemas() -> Tuple[Dict[str, Any], Dict[str, Any], Draft7Validator, Draft7Validator]:
     """Load and set up schema validators with Windows-compatible $ref resolution.
+    
+    Uses runtime.schema_loader for VLM hypothesis validator to avoid circular imports.
     
     Returns:
         Tuple of (vlm_schema, belief_schema, vlm_validator, belief_validator)
@@ -44,41 +50,15 @@ def load_schemas() -> Tuple[Dict[str, Any], Dict[str, Any], Draft7Validator, Dra
     }
     
     # Create resolver and validators
+    # Use shared VLM validator from schema_loader (for consistency with vlm/ollama_client.py)
+    vlm_validator = load_hypothesis_validator()
+    
     # belief_schema references vlm_schema via $ref, so use belief_schema as referrer
     belief_schema_uri = f"{schema_dir_uri}belief_state.schema.json"
     resolver = RefResolver(base_uri=belief_schema_uri, referrer=belief_schema, store=store)
-    vlm_validator = Draft7Validator(vlm_schema, resolver=resolver)
     belief_validator = Draft7Validator(belief_schema, resolver=resolver)
     
     return vlm_schema, belief_schema, vlm_validator, belief_validator
-
-
-def validate_or_error(
-    validator: Draft7Validator,
-    instance: Any
-) -> Tuple[bool, Optional[Dict[str, Any]]]:
-    """Validate instance against schema and return detailed error if invalid.
-    
-    Args:
-        validator: Schema validator instance.
-        instance: Instance to validate.
-        
-    Returns:
-        Tuple of (is_valid, error_info). error_info is None if valid, otherwise
-        contains keys: message, path (list), schema_path (list).
-    """
-    errors = list(validator.iter_errors(instance))
-    if not errors:
-        return True, None
-    
-    # Get first error for details
-    error = errors[0]
-    return False, {
-        "message": error.message,
-        "path": list(error.absolute_path),
-        "schema_path": list(error.absolute_schema_path),
-        "type": "schema"
-    }
 
 
 def generate_mock_vlm_output(rng: random.Random) -> Any:
@@ -365,6 +345,7 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=20, help="Number of steps to run")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for determinism")
     parser.add_argument("--self-check", action="store_true", help="Run self-check tests and exit")
+    parser.add_argument("--use-ollama", action="store_true", help="Use Ollama VLM backend instead of mock")
     args = parser.parse_args()
     
     if args.self_check:
@@ -385,6 +366,13 @@ def main() -> None:
     memory_store = seed_demo_store()
     embedder = DeterministicEmbedder(dim=64)
     
+    # Initialize VLM client
+    use_ollama = args.use_ollama or os.getenv("VLM_BACKEND") == "ollama"
+    if use_ollama:
+        vlm_client = OllamaVLMClient()
+    else:
+        vlm_client = None
+    
     # Main loop
     for step_id in range(args.steps):
         # Deep copy belief_before
@@ -404,9 +392,6 @@ def main() -> None:
         # Always update belief with candidates (even if empty) for schema safety
         apply_memory_retrieval(belief, candidates, MEMORY_SCORE_THRESH)
         
-        # Generate mock VLM output
-        vlm_raw = generate_mock_vlm_output(rng)
-        
         # Initialize meta and verifier_result
         meta: Dict[str, Any] = {
             "vlm_latency_ms": 0.0,
@@ -417,6 +402,69 @@ def main() -> None:
             "retrieval_best_score": candidates[0]["score"] if candidates else None,
             "retrieval_threshold_pass": candidates[0]["score"] >= MEMORY_SCORE_THRESH if candidates else False
         }
+        
+        # Generate VLM output (Ollama or mock)
+        if use_ollama:
+            # Build candidate_nodes_top once to ensure alignment
+            candidate_nodes_top = candidates[:3]  # top 3 with {node_id, score}
+            
+            # Precompute memory_context (plain data, no runtime objects)
+            memory_context = []
+            missing_node_ids = []
+            for cand in candidate_nodes_top:
+                node = memory_store.get_node(cand["node_id"])
+                if node:
+                    memory_context.append({
+                        "node_id": node.node_id,
+                        "score": cand["score"],
+                        "tags": node.tags,
+                        "summary": node.summary[:50]  # truncate to 50 chars
+                    })
+                else:
+                    # Node missing: append placeholder entry to keep prompt aligned
+                    memory_context.append({
+                        "node_id": cand["node_id"],
+                        "score": cand["score"],
+                        "tags": ["<missing>"],
+                        "summary": "<missing>"
+                    })
+                    missing_node_ids.append(cand["node_id"])
+            
+            # Track missing nodes in meta (for debuggability)
+            if missing_node_ids:
+                meta["memory_context_missing_nodes"] = True
+                meta["memory_context_missing_node_ids"] = missing_node_ids
+            else:
+                meta["memory_context_missing_nodes"] = False
+            
+            # Build context dict (ONLY JSON-serializable data)
+            context = {
+                "goal_text": belief["goal_text"],
+                "active_constraints": belief["active_constraints"],
+                "belief_target_status": belief.get("target_status"),
+                "candidate_nodes": candidate_nodes_top,
+                "memory_context": memory_context
+            }
+            
+            # Call Ollama client
+            vlm_raw, client_meta = vlm_client.propose_hypothesis(context)
+            
+            # Merge client meta into meta
+            meta["vlm_backend"] = client_meta.get("vlm_backend", "ollama")
+            meta["vlm_model"] = client_meta.get("vlm_model")
+            meta["vlm_latency_ms"] = client_meta.get("vlm_latency_ms", 0.0)
+            meta["vlm_parse_ok"] = client_meta.get("vlm_parse_ok", False)
+            meta["vlm_schema_ok"] = client_meta.get("vlm_schema_ok", False)
+            meta["vlm_retry_count"] = client_meta.get("vlm_retry_count", 0)
+            meta["vlm_error"] = client_meta.get("vlm_error")
+            
+            # If hypothesis is None, use fallback
+            if vlm_raw is None:
+                vlm_raw = generate_fallback_hypothesis(belief, candidates)
+        else:
+            # Mock mode
+            meta["vlm_backend"] = "mock"
+            vlm_raw = generate_mock_vlm_output(rng)
         verifier_result: Dict[str, Any] = {
             "ok": False,
             "reason_code": "SKIPPED",
