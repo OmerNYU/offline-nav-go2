@@ -34,7 +34,16 @@
     "next_action": {
       "type": "string",
       "enum": ["approach", "explore", "rotate", "goto_node", "ask_clarification", "stop"]
-    }
+    },
+    "last_visibility": {
+      "anyOf": [
+        { "type": "object" },
+        { "type": "null" }
+      ]
+    },
+    "visibility_streak": { "type": "integer", "minimum": 0 },
+    "last_seen_node_id": { "type": ["integer", "null"], "minimum": 0 },
+    "visible_since_step": { "type": ["integer", "null"], "minimum": 0 }
   }
 }
 

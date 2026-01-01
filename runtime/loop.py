@@ -14,6 +14,7 @@ from memory.embedding import DeterministicEmbedder
 from memory.retrieval import retrieve_candidates
 from memory.store import seed_demo_store
 from memory.utils import tokenize
+from perception.check_visibility import check_visibility
 from planner.verifier_stub import VerifierStub
 from runtime.logger import DecisionLogger
 from runtime.memory_bridge import apply_memory_retrieval
@@ -180,7 +181,11 @@ def initialize_belief_state(belief_validator: Draft7Validator) -> Dict[str, Any]
         "next_action": "explore",  # Valid enum value
         "current_node_id": None,
         "last_vlm_hypothesis": None,
-        "rejection_reason": None  # Explicit initialization for clarity
+        "rejection_reason": None,  # Explicit initialization for clarity
+        "last_visibility": None,
+        "visibility_streak": 0,
+        "last_seen_node_id": None,
+        "visible_since_step": None
     }
     
     # Validate that initial state is schema-compliant
@@ -464,6 +469,7 @@ def main() -> None:
         else:
             # Mock mode
             meta["vlm_backend"] = "mock"
+            memory_context = []  # No memory context in mock mode
             vlm_raw = generate_mock_vlm_output(rng)
         verifier_result: Dict[str, Any] = {
             "ok": False,
@@ -527,10 +533,10 @@ def main() -> None:
         else:
             belief["last_vlm_hypothesis"] = None
         
-        # 2) target_status: Only PROMOTE to "visible", never auto-demote
-        if verifier_result.get("ok", False) and vlm_validated and vlm_validated.get("target_status") == "visible":
-            belief["target_status"] = "visible"
-        # Otherwise, keep current target_status (no auto-demotion)
+        # 2) target_status: VLM can NO LONGER set visible/done
+        # Only perception can promote to "visible" or "done"
+        # (this logic is now handled by perception visibility gate after action simulation)
+        # Keep current target_status (no auto-demotion)
         
         # 3) rejection_reason
         if vlm_validated is None:
@@ -548,6 +554,78 @@ def main() -> None:
             belief["next_action"] = vlm_validated["action"]
         else:
             belief["next_action"] = "explore"
+        
+        # 5) Simulate action execution (BEFORE perception check)
+        # Use final executed action (belief["next_action"]) so fallback-chosen actions are also simulated
+        if belief["next_action"] == "goto_node":
+            # Extract target node from last_vlm_hypothesis (works for both VLM and fallback)
+            target_node_id = belief.get("last_vlm_hypothesis", {}).get("navigation_goal", {}).get("node_id")
+            if target_node_id is not None:
+                belief["current_node_id"] = target_node_id
+        # Other actions (approach, explore, rotate, stop, ask_clarification) don't change current_node_id
+        
+        # 6) Perception visibility check (AFTER action execution)
+        # This is the ONLY authority that can set target_status to "visible" or "done"
+        vr = check_visibility(
+            goal_text=belief["goal_text"],
+            current_node_id=belief.get("current_node_id"),
+            memory_context=memory_context,
+            belief_state=belief
+        )
+        
+        # Initialize new fields if not present (backward compatibility)
+        if "last_visibility" not in belief:
+            belief["last_visibility"] = None
+        if "visibility_streak" not in belief:
+            belief["visibility_streak"] = 0
+        if "last_seen_node_id" not in belief:
+            belief["last_seen_node_id"] = None
+        if "visible_since_step" not in belief:
+            belief["visible_since_step"] = None
+        
+        # Update visibility fields
+        belief["last_visibility"] = vr
+        
+        # Update visibility streak (hysteresis mechanism)
+        if vr["is_visible"]:
+            belief["visibility_streak"] = belief.get("visibility_streak", 0) + 1
+        else:
+            belief["visibility_streak"] = 0
+        
+        # Track belief transitions for logging
+        belief_transition = None
+        old_status = belief["target_status"]
+        
+        # Transition 1: searching/likely_in_memory -> visible (requires K=2 consecutive hits)
+        K = 2  # Hysteresis threshold
+        if belief["visibility_streak"] >= K and belief["target_status"] not in {"visible", "done"}:
+            belief["target_status"] = "visible"
+            belief["last_seen_node_id"] = belief["current_node_id"]
+            belief["visible_since_step"] = step_id
+            belief_transition = f"{old_status}->visible"
+        
+        # Transition 2: visible -> done (requires approach action + perception + close_enough)
+        if belief["target_status"] == "visible" and belief["next_action"] == "approach" and vr["is_visible"]:
+            # Close enough check with visible_since_step guard
+            # This prevents immediate transition to done right after becoming visible
+            close_enough = (
+                belief.get("visible_since_step") is not None
+                and step_id > belief.get("visible_since_step")
+                and belief.get("current_node_id") is not None
+                and belief.get("current_node_id") == belief.get("last_seen_node_id")
+            )
+            if close_enough:
+                belief["target_status"] = "done"
+                belief_transition = "visible->done"
+        
+        # Add perception logging fields to meta
+        meta["perception_backend"] = vr["backend"]
+        meta["perception_visible"] = vr["is_visible"]
+        meta["perception_confidence"] = vr["confidence"]
+        meta["perception_latency_ms"] = vr["latency_ms"]
+        meta["visibility_streak"] = belief["visibility_streak"]
+        meta["belief_transition"] = belief_transition
+        meta["perception_reason"] = vr["evidence"]["reason"]
         
         # Validate updated belief state
         is_valid, error = validate_or_error(belief_validator, belief)
