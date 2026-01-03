@@ -357,3 +357,20 @@ def test_streak_resets_on_not_visible(monkeypatch):
     
     assert belief["visibility_streak"] == 0
 
+
+def test_integration_done_requires_distance_threshold():
+    """Smoke test: done transition requires distance <= CLOSE_ENOUGH_M."""
+    # This is a minimal integration test - detailed logic tested in unit tests
+    from runtime.loop import compute_close_enough, CLOSE_ENOUGH_M
+    
+    belief = {"visible_since_step": 5, "target_status": "visible"}
+    vr_close = {"distance_m": 0.5, "backend": "node_oracle_relpose", "is_visible": True}
+    vr_far = {"distance_m": 2.0, "backend": "node_oracle_relpose", "is_visible": True}
+    
+    # Close: should allow done
+    close_enough_close = compute_close_enough(belief, vr_close, 10, CLOSE_ENOUGH_M, "node_oracle_relpose")
+    assert close_enough_close is True
+    
+    # Far: should prevent done
+    close_enough_far = compute_close_enough(belief, vr_far, 10, CLOSE_ENOUGH_M, "node_oracle_relpose")
+    assert close_enough_far is False

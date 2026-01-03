@@ -3,7 +3,12 @@
 import time
 from typing import Any, Dict, List, Optional, Union
 
-from perception.config import DEFAULT_PERCEPTION_BACKEND, get_node_oracle_map
+from perception.config import (
+    DEFAULT_PERCEPTION_BACKEND,
+    get_node_oracle_map,
+    normalize_goal_text,
+    get_node_oracle_relpose_map
+)
 
 
 def check_visibility(
@@ -33,6 +38,9 @@ def check_visibility(
             - confidence: float 0.0 to 1.0
             - backend: str indicating backend used
             - latency_ms: int milliseconds taken
+            - distance_m: Optional[float] distance to target in meters (relpose only)
+            - bearing_rad: Optional[float] bearing to target in radians (relpose only)
+            - target_goal_key: Optional[str] normalized goal text (relpose only, debug)
             - evidence: dict with:
                 - reason: str explanation
                 - node_id: int or None
@@ -50,6 +58,9 @@ def check_visibility(
         "confidence": 0.0,
         "backend": backend,
         "latency_ms": 0,
+        "distance_m": None,      # NEW: initialize to None
+        "bearing_rad": None,     # NEW: initialize to None
+        "target_goal_key": None, # NEW: initialize to None
         "evidence": {
             "reason": "not_checked",
             "node_id": current_node_id,
@@ -80,6 +91,72 @@ def check_visibility(
                     result["evidence"]["extra"]["note"] = "current_node_id is None"
                 else:
                     result["evidence"]["extra"]["note"] = f"node {current_node_id} not in oracle map"
+        elif backend == "node_oracle_relpose":
+            # Get relpose map from config or default
+            if config and "relpose_map" in config:
+                relpose_map = config["relpose_map"]
+            else:
+                relpose_map = get_node_oracle_relpose_map()
+            
+            # Normalize goal for consistent lookup
+            goal_key = normalize_goal_text(goal_text)
+            result["target_goal_key"] = goal_key
+            
+            # Lookup (goal_key, current_node_id)
+            if current_node_id is not None and goal_key in relpose_map:
+                node_data = relpose_map[goal_key].get(current_node_id)
+                
+                if node_data:
+                    # Extract fields (use .get() for safety)
+                    distance_m = node_data.get("distance_m")
+                    bearing_rad = node_data.get("bearing_rad")
+                    confidence = node_data.get("confidence")
+                    
+                    # Fallback confidence: try visibility map, then default to 1.0
+                    if confidence is None:
+                        oracle_map = get_node_oracle_map()
+                        confidence = oracle_map.get(current_node_id, 1.0)
+                    
+                    # FIX D: Clamp confidence to [0.0, 1.0]
+                    try:
+                        confidence = float(confidence)
+                        confidence = max(0.0, min(1.0, confidence))
+                    except (TypeError, ValueError):
+                        confidence = 0.0  # Invalid value → safe default
+                    
+                    # Visibility decision: confidence > 0.0 (deterministic)
+                    result["is_visible"] = confidence > 0.0
+                    result["confidence"] = confidence
+                    result["distance_m"] = distance_m
+                    result["bearing_rad"] = bearing_rad
+                    result["evidence"]["reason"] = "relpose_hit"
+                    result["evidence"]["extra"]["goal_key"] = goal_key
+                    result["evidence"]["extra"]["distance_m"] = distance_m
+                    result["evidence"]["extra"]["bearing_rad"] = bearing_rad
+                    result["evidence"]["extra"]["confidence"] = confidence
+                else:
+                    # Node not mapped for this goal
+                    result["is_visible"] = False
+                    result["confidence"] = 0.0
+                    # TWEAK 3: Explicitly set to None in miss paths
+                    result["distance_m"] = None
+                    result["bearing_rad"] = None
+                    result["evidence"]["reason"] = "relpose_miss"
+                    result["evidence"]["extra"]["note"] = f"node {current_node_id} not mapped for goal '{goal_key}'"
+            else:
+                # Goal or node not found
+                result["is_visible"] = False
+                result["confidence"] = 0.0
+                # TWEAK 3: Explicitly set to None in miss paths
+                result["distance_m"] = None
+                result["bearing_rad"] = None
+                result["evidence"]["reason"] = "relpose_miss"
+                if current_node_id is None:
+                    result["evidence"]["extra"]["note"] = "current_node_id is None"
+                elif goal_key not in relpose_map:
+                    result["evidence"]["extra"]["note"] = f"goal_key '{goal_key}' not in relpose map"
+                else:
+                    result["evidence"]["extra"]["note"] = f"node {current_node_id} not in goal '{goal_key}' mapping"
         else:
             # Unknown backend
             result["evidence"]["reason"] = "unknown_backend"

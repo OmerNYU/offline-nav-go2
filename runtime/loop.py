@@ -23,6 +23,67 @@ from vlm.fallback import generate_fallback_hypothesis
 from vlm.ollama_client import OllamaVLMClient
 
 
+# Perception constants
+CLOSE_ENOUGH_M = 0.75  # Distance threshold for done transition (meters)
+
+
+def compute_close_enough(
+    belief: Dict[str, Any],
+    vr: Dict[str, Any],
+    step_id: int,
+    close_enough_m: float,
+    backend: str
+) -> bool:
+    """Compute close_enough predicate for done gating.
+    
+    The done transition requires multiple conditions (visible status, approach action,
+    perception visible, close_enough). This function computes the close_enough component.
+    
+    Policy:
+    - Always requires visible_since_step guard (step_id > visible_since_step)
+    - node_oracle_relpose backend: requires distance_m <= close_enough_m
+    - node_oracle backend: uses node-based check (current == last_seen)
+    - Unknown backend or missing data: returns False (safe default)
+    
+    Args:
+        belief: Current belief state dict
+        vr: Visibility result from check_visibility()
+        step_id: Current step ID
+        close_enough_m: Distance threshold in meters
+        backend: Perception backend identifier (must be "node_oracle_relpose" or "node_oracle")
+        
+    Returns:
+        True if close enough for done transition, False otherwise
+    """
+    # Guard: prevent immediate done on same step as visible
+    visible_since = belief.get("visible_since_step")
+    if visible_since is None or step_id <= visible_since:
+        return False
+    
+    # Backend-specific logic (FIX F: explicit policy)
+    if backend == "node_oracle_relpose":
+        # Relpose backend: REQUIRE distance_m
+        distance_m = vr.get("distance_m")
+        if distance_m is not None:
+            # TWEAK 5: Type safety for distance comparison
+            try:
+                distance = float(distance_m)
+                return distance <= close_enough_m
+            except (TypeError, ValueError):
+                return False  # Invalid distance type → safe default
+        else:
+            return False  # Missing distance on relpose backend → not close
+    elif backend == "node_oracle":
+        # Classic backend: node-based check for backward compatibility
+        current_node = belief.get("current_node_id")
+        last_seen_node = belief.get("last_seen_node_id")
+        return (current_node is not None 
+                and current_node == last_seen_node)
+    else:
+        # Unknown backend → safe default
+        return False
+
+
 def load_schemas() -> Tuple[Dict[str, Any], Dict[str, Any], Draft7Validator, Draft7Validator]:
     """Load and set up schema validators with Windows-compatible $ref resolution.
     
@@ -606,14 +667,15 @@ def main() -> None:
         
         # Transition 2: visible -> done (requires approach action + perception + close_enough)
         if belief["target_status"] == "visible" and belief["next_action"] == "approach" and vr["is_visible"]:
-            # Close enough check with visible_since_step guard
-            # This prevents immediate transition to done right after becoming visible
-            close_enough = (
-                belief.get("visible_since_step") is not None
-                and step_id > belief.get("visible_since_step")
-                and belief.get("current_node_id") is not None
-                and belief.get("current_node_id") == belief.get("last_seen_node_id")
+            # Use extracted helper for close_enough logic (FIX F, FIX H)
+            close_enough = compute_close_enough(
+                belief=belief,
+                vr=vr,
+                step_id=step_id,
+                close_enough_m=CLOSE_ENOUGH_M,
+                backend=vr["backend"]
             )
+            
             if close_enough:
                 belief["target_status"] = "done"
                 belief_transition = "visible->done"
@@ -623,9 +685,13 @@ def main() -> None:
         meta["perception_visible"] = vr["is_visible"]
         meta["perception_confidence"] = vr["confidence"]
         meta["perception_latency_ms"] = vr["latency_ms"]
+        meta["perception_distance_m"] = vr.get("distance_m")        # NEW
+        meta["perception_bearing_rad"] = vr.get("bearing_rad")      # NEW
+        meta["perception_target_goal_key"] = vr.get("target_goal_key")  # NEW
         meta["visibility_streak"] = belief["visibility_streak"]
         meta["belief_transition"] = belief_transition
         meta["perception_reason"] = vr["evidence"]["reason"]
+        meta["perception_evidence"] = vr["evidence"]                # NEW: full evidence dict
         
         # Validate updated belief state
         is_valid, error = validate_or_error(belief_validator, belief)
